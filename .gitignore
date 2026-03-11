@@ -1,0 +1,6 @@
+# IOL binary images
+*.iol
+*.bin
+
+# IOURC license files
+iourc
