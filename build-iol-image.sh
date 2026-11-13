@@ -1,73 +1,83 @@
 #!/usr/bin/env bash
+# Build Sherpa's Cisco IOL image from a CML IOL image.
 set -euo pipefail
+
+# The launcher version this build was tested with.
+TESTED_LAUNCHER_VERSION="0.2.2"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") <iol-binary-path> <version> [--l2]
+Usage: $(basename "$0") <cml-image>
 
-Build a Cisco IOL Docker image.
+Build a Sherpa Cisco IOL image on top of a Cisco CML IOL image.
 
 Arguments:
-    iol-binary-path    Path to the IOL binary file
-    version            IOL version (e.g., 17.12.01)
-    --l2               Build an L2 (switching) image
+    cml-image    The CML image tarball (for example iol-xe-17-18-02.tar.gz), or the tag of a
+                 CML image already loaded into Docker (for example iol-xe/iol-xe:17-18-02).
 
-Examples:
-    $(basename "$0") /path/to/x86_64_crb_linux-adventerprisek9-ms.bin 17.12.01
-    $(basename "$0") /path/to/x86_64_crb_linux_l2-adventerprisek9-ms.bin 17.12.01 --l2
+The variant and version come from the CML image's tag:
+    iol-xe/iol-xe:17-18-02     ->  localrepo/cisco_iol:17.18.02
+    iol-xe/ioll2-xe:17-18-02   ->  localrepo/cisco_iol_l2:17.18.02
+
+No Cisco files are included in this repository; bring your own CML images.
 EOF
     exit 1
 }
 
-if [[ $# -lt 2 ]]; then
+fail() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+if [[ $# -ne 1 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
     usage
 fi
 
-IOL_BINARY="$1"
-VERSION="$2"
-L2=false
-
-if [[ $# -ge 3 ]] && [[ "$3" == "--l2" ]]; then
-    L2=true
-fi
-
-if [[ ! -f "$IOL_BINARY" ]]; then
-    echo "Error: IOL binary not found: $IOL_BINARY"
-    exit 1
-fi
-
-if [[ -z "$VERSION" ]]; then
-    echo "Error: Version is required"
-    exit 1
-fi
-
-if [[ "$L2" == true ]]; then
-    IMAGE_TAG="sherpa/cisco_iol:L2-${VERSION}"
-else
-    IMAGE_TAG="sherpa/cisco_iol:${VERSION}"
-fi
-
+SOURCE="$1"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-IOL_DIR="${SCRIPT_DIR}/iol"
 
-if [[ ! -d "$IOL_DIR" ]]; then
-    echo "Error: IOL support files directory not found: $IOL_DIR"
-    exit 1
+if [[ -f "$SOURCE" ]]; then
+    echo "Loading ${SOURCE}"
+    LOADED="$(docker load --input "$SOURCE")"
+    echo "$LOADED"
+    CML_IMAGE="$(sed -n 's/^Loaded image: //p' <<<"$LOADED" | head -n 1)"
+    [[ -n "$CML_IMAGE" ]] || fail "docker load did not report a tagged image"
+else
+    CML_IMAGE="$SOURCE"
 fi
 
-BUILD_CONTEXT="$(mktemp -d)"
-trap 'rm -rf "$BUILD_CONTEXT"' EXIT
+docker image inspect "$CML_IMAGE" >/dev/null 2>&1 || fail "no such image: ${CML_IMAGE}"
 
-cp "$IOL_BINARY" "${BUILD_CONTEXT}/iol.bin"
-cp "${IOL_DIR}/Dockerfile" "${BUILD_CONTEXT}/Dockerfile"
-cp "${IOL_DIR}/entrypoint.sh" "${BUILD_CONTEXT}/entrypoint.sh"
-cp "${IOL_DIR}/start-iol.sh" "${BUILD_CONTEXT}/start-iol.sh"
-cp "${IOL_DIR}/config.txt" "${BUILD_CONTEXT}/config.txt"
-cp "${IOL_DIR}/keygen.py" "${BUILD_CONTEXT}/keygen.py"
+REPOSITORY="${CML_IMAGE%:*}"
+TAG="${CML_IMAGE##*:}"
+[[ "$REPOSITORY" != "$CML_IMAGE" ]] || fail "the image has no tag: ${CML_IMAGE}"
 
-echo "Building IOL image: ${IMAGE_TAG}"
-docker build --network=host -t "$IMAGE_TAG" "$BUILD_CONTEXT"
+case "${REPOSITORY##*/}" in
+    iol-xe) MODEL="cisco_iol" ;;
+    ioll2-xe) MODEL="cisco_iol_l2" ;;
+    *) fail "not a CML IOL image: ${REPOSITORY} (expected .../iol-xe or .../ioll2-xe)" ;;
+esac
+
+[[ "$TAG" =~ ^[0-9]+(-[0-9]+)+$ ]] || fail "unexpected CML tag '${TAG}', expected one like 17-18-02"
+VERSION="${TAG//-/.}"
+
+LAUNCHER_VERSION="$(docker run --rm --entrypoint /iol-runner "$CML_IMAGE" -h 2>&1 |
+    sed -n 's/^[[:space:]]*Version:[[:space:]]*//p' | head -n 1)"
+[[ -n "$LAUNCHER_VERSION" ]] || fail "${CML_IMAGE} has no Cisco IOL launcher at /iol-runner"
+echo "Cisco IOL launcher: ${LAUNCHER_VERSION}"
+if [[ "$LAUNCHER_VERSION" != "$TESTED_LAUNCHER_VERSION" ]]; then
+    echo "Warning: this build was tested with launcher ${TESTED_LAUNCHER_VERSION}; the launcher's" \
+        "configuration or sockets may have changed." >&2
+fi
+
+IMAGE_TAG="localrepo/${MODEL}:${VERSION}"
+echo "Building ${IMAGE_TAG} from ${CML_IMAGE}"
+docker build \
+    --build-arg "CML_IMAGE=${CML_IMAGE}" \
+    --file "${SCRIPT_DIR}/image/Dockerfile" \
+    --tag "$IMAGE_TAG" \
+    "$SCRIPT_DIR"
 
 echo ""
-echo "Successfully built: ${IMAGE_TAG}"
-echo "Run with: docker run --rm --privileged ${IMAGE_TAG}"
+echo "Built ${IMAGE_TAG}"
+echo "On the Sherpa server, record it with: sherpa server image scan"
