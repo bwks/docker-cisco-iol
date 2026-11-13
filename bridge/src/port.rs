@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,8 @@ pub const MAX_PORTS: u16 = 64;
 /// How often a waiting port looks for its interface, and how long a read waits before the
 /// relay checks that its interface is still the one it opened.
 const POLL: Duration = Duration::from_millis(500);
+/// The mode of the bridge's port sockets: any user may send to them.
+const SOCKET_MODE: u32 = 0o666;
 /// Larger than any frame: the container's veths can be 9600 bytes.
 const FRAME_BUFFER: usize = 65_536;
 
@@ -80,6 +83,8 @@ pub fn run(port: &Port) -> io::Result<()> {
         _ => {}
     }
     let socket = UnixDatagram::bind(&port.listen)?;
+    // The launcher may run as another user, which must be able to send to it.
+    fs::set_permissions(&port.listen, fs::Permissions::from_mode(SOCKET_MODE))?;
     socket.set_read_timeout(Some(POLL))?;
     loop {
         let Some(ifindex) = interface_index(&port.interface) else {
@@ -342,6 +347,35 @@ mod tests {
 
             wire.attached.store(false, Ordering::Relaxed);
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_port_socket_is_writable_by_a_launcher_running_as_another_user() {
+        let dir = test_dir();
+        let mut port = Port::new(4, &dir);
+        port.interface = "no-such-if4".to_owned();
+        let listen = port.listen.clone();
+        thread::spawn(move || run(&port));
+
+        let started = Instant::now();
+        while fs::metadata(&listen).is_err() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "socket not bound"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Bound, then opened up: wait for the mode, not just the file.
+        let mut mode = 0;
+        while started.elapsed() < Duration::from_secs(5) {
+            mode = fs::metadata(&listen).unwrap().permissions().mode() & 0o777;
+            if mode == 0o666 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(mode, 0o666);
         let _ = fs::remove_dir_all(&dir);
     }
 

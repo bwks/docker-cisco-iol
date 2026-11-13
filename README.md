@@ -77,7 +77,7 @@ The image is the CML image with three additions. Nothing of Cisco's is changed o
 | Mount | Meaning |
 |---|---|
 | `/config` | `ios_config.txt`, the startup config, if there is one. Without one IOL boots to its factory state. |
-| `/tmp/run` | IOL's NVRAM. Mounted from the host, a config saved with `write memory` survives a restart of the container and wins over `ios_config.txt`. |
+| `/tmp/run` | IOL's NVRAM. Mounted from the host, a config saved with `write memory` survives a restart of the container and wins over `ios_config.txt`. IOL runs as the owner of `/tmp/run`, so what it writes there belongs to the host user who owns the folder. |
 
 Interface `ethN` is IOL's `Ethernet(N / 4)/(N % 4)`: `eth0` is `Ethernet0/0`, `eth1` is
 `Ethernet0/1`, `eth4` is `Ethernet1/0`.

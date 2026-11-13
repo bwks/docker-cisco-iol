@@ -37,11 +37,17 @@ in_range "$IOL_ETH_PORTS" 1 64 || fail "IOL_ETH_PORTS must be 1 to 64, not '$IOL
 # The launcher exits without /tmp/run. Sockets left by an earlier run of this container
 # would stop the launcher binding its own.
 mkdir -p /tmp/run
+# IOL runs as the owner of /tmp/run, so the NVRAM it writes in a folder mounted from the host
+# stays the host user's to delete. The launcher runs as that user too and makes its sockets in
+# /tmp, the container's own.
+RUN_UID="$(stat -c %u /tmp/run)"
+RUN_GID="$(stat -c %g /tmp/run)"
+chmod 1777 /tmp
 rm -rf /tmp/s[0-9][0-9].sock /tmp/c[0-9][0-9].sock /tmp/console.sock /tmp/control.sock \
     /tmp/netio[0-9]*
 
-printf '{"binary":"/binary.iol","memory":%s,"num-eth":%s,"num-serial":0,"local-app":%s,"remote-app":%s,"user-id":0,"group-id":0}\n' \
-    "$IOL_MEMORY_MB" "$IOL_ETH_PORTS" "$IOL_ID" "$REMOTE_APP_ID" >"$LAUNCHER_CONFIG"
+printf '{"binary":"/binary.iol","memory":%s,"num-eth":%s,"num-serial":0,"local-app":%s,"remote-app":%s,"user-id":%s,"group-id":%s}\n' \
+    "$IOL_MEMORY_MB" "$IOL_ETH_PORTS" "$IOL_ID" "$REMOTE_APP_ID" "$RUN_UID" "$RUN_GID" >"$LAUNCHER_CONFIG"
 
 # IOL owns the management address. Left on eth0, the kernel would answer for it too.
 if [ -e /sys/class/net/eth0 ]; then
