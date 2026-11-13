@@ -18,6 +18,8 @@ FROM busybox:1.37-musl AS busybox
 FROM ${CML_IMAGE}
 COPY --from=busybox /bin/busybox /bin/busybox
 RUN ["/bin/busybox", "--install", "-s", "/bin"]
+# Docker exec as user root, as Sherpa runs it, needs root in /etc/passwd; the CML image has none.
+RUN [ -e /etc/passwd ] || { echo 'root:x:0:0:root:/:/bin/sh' >/etc/passwd; echo 'root:x:0:' >/etc/group; }
 COPY --from=bridge /src/target/release/iol-bridge /usr/local/bin/iol-bridge
 COPY image/entrypoint.sh /usr/local/bin/sherpa-iol-entrypoint
 ENTRYPOINT ["/bin/sh", "/usr/local/bin/sherpa-iol-entrypoint"]
