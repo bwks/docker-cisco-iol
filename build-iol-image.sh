@@ -17,7 +17,7 @@ Arguments:
 
 The variant and version come from the CML image's tag:
     iol-xe/iol-xe:17-18-02     ->  localrepo/cisco_iol:17.18.02
-    iol-xe/ioll2-xe:17-18-02   ->  localrepo/cisco_iol_l2:17.18.02
+    iol-xe/ioll2-xe:17-18-02   ->  localrepo/cisco_ioll2:17.18.02
 
 No Cisco files are included in this repository; bring your own CML images.
 EOF
@@ -54,7 +54,7 @@ TAG="${CML_IMAGE##*:}"
 
 case "${REPOSITORY##*/}" in
     iol-xe) MODEL="cisco_iol" ;;
-    ioll2-xe) MODEL="cisco_iol_l2" ;;
+    ioll2-xe) MODEL="cisco_ioll2" ;;
     *) fail "not a CML IOL image: ${REPOSITORY} (expected .../iol-xe or .../ioll2-xe)" ;;
 esac
 

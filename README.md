@@ -1,7 +1,7 @@
 # docker-cisco-iol
 
 Builds the Cisco IOL container images for [Sherpa](https://github.com/bwks/sherpa)'s
-`cisco_iol` and `cisco_iol_l2` node models, on top of the Cisco Modeling Labs (CML) IOL images
+`cisco_iol` and `cisco_ioll2` node models, on top of the Cisco Modeling Labs (CML) IOL images
 you already have.
 
 **No Cisco files are included in this repository**, and none must ever be added: no images,
@@ -12,7 +12,7 @@ binaries, licence files or anything taken from them. You bring your own CML IOL 
 - Docker.
 - Your own CML IOL image tarballs, from a CML release's reference platform files:
   - `iol-xe-<version>.tar.gz`, IOL XE (router), for `cisco_iol`;
-  - `ioll2-xe-<version>.tar.gz`, IOL XE L2 (switch), for `cisco_iol_l2`.
+  - `ioll2-xe-<version>.tar.gz`, IOL XE L2 (switch), for `cisco_ioll2`.
 
 The images are licensed by Cisco for use within CML. Check that your licence allows using
 them with Sherpa before you build.
@@ -33,7 +33,7 @@ The variant and version come from the CML image's tag:
 | CML image | Sherpa image |
 |---|---|
 | `iol-xe/iol-xe:17-18-02` | `localrepo/cisco_iol:17.18.02` |
-| `iol-xe/ioll2-xe:17-18-02` | `localrepo/cisco_iol_l2:17.18.02` |
+| `iol-xe/ioll2-xe:17-18-02` | `localrepo/cisco_ioll2:17.18.02` |
 
 The script prints the version of Cisco's IOL launcher in the CML image, and warns when it is
 not the version this build was tested with (0.2.2).
