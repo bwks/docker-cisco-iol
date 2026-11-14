@@ -87,15 +87,15 @@ pub fn run(port: &Port) -> io::Result<()> {
     fs::set_permissions(&port.listen, fs::Permissions::from_mode(SOCKET_MODE))?;
     socket.set_read_timeout(Some(POLL))?;
     loop {
-        let Some(interface) = find_interface(&port.interface) else {
+        let Some(ifindex) = find_interface(&port.interface) else {
             discard(&socket, POLL);
             continue;
         };
-        match PacketSocket::open(&interface, POLL) {
+        match PacketSocket::open(&port.interface, ifindex, POLL) {
             Ok(wire) => {
                 eprintln!(
-                    "iol-bridge: {} attached (ifindex {})",
-                    port.interface, interface.index
+                    "iol-bridge: {} attached (ifindex {ifindex})",
+                    port.interface
                 );
                 relay(&socket, &port.launcher, &wire);
                 eprintln!("iol-bridge: {} detached", port.interface);
@@ -162,9 +162,8 @@ fn launcher_to_wire(socket: &UnixDatagram, wire: &impl Wire, attached: &AtomicBo
     while attached.load(Ordering::Relaxed) {
         match socket.recv(&mut buf) {
             Ok(len) => {
-                if let Err(error) = wire.send(&buf[..len])
-                    && (is_gone(&error) || !wire.is_attached())
-                {
+                // A send fails for the frame, or because the interface is gone or down.
+                if wire.send(&buf[..len]).is_err() && !wire.is_attached() {
                     attached.store(false, Ordering::Relaxed);
                 }
             }
@@ -187,12 +186,6 @@ pub fn is_timeout(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
     )
-}
-
-/// Whether a send failed because the interface is gone or down, rather than for the frame.
-fn is_gone(error: &io::Error) -> bool {
-    // ENXIO, ENODEV, ENETDOWN
-    matches!(error.raw_os_error(), Some(6 | 19 | 100))
 }
 
 #[cfg(test)]
@@ -285,15 +278,6 @@ mod tests {
     fn the_port_count_is_the_only_argument() {
         assert!(parse_port_count(&[]).is_err());
         assert!(parse_port_count(&["16".to_owned(), "1".to_owned()]).is_err());
-    }
-
-    #[test]
-    fn a_missing_interface_or_down_device_is_gone() {
-        for errno in [6, 19, 100] {
-            assert!(is_gone(&io::Error::from_raw_os_error(errno)));
-        }
-        // EMSGSIZE: the frame, not the interface.
-        assert!(!is_gone(&io::Error::from_raw_os_error(90)));
     }
 
     #[test]

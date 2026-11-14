@@ -1,103 +1,140 @@
-//! A raw `AF_PACKET` channel on one interface, through `pnet_datalink`: bound to the interface,
-//! promiscuous, reading every protocol.
+//! Live captures on one interface, through libpcap: one that reads the frames arriving on it,
+//! one that transmits.
 //!
-//! The kernel never reads a frame back to the socket that sent it, so the frames IOL transmits
-//! do not come back. Other frames sent on the interface come from the container's own network
-//! stack, with the interface's MAC address as their source; they are skipped by that address,
-//! as `pnet_datalink` does not report a frame's packet type.
+//! The kernel takes the 802.1Q tag off a received frame and passes it beside the frame, in the
+//! packet socket's auxiliary data. libpcap puts the tag back, so IOL receives a trunk's frames
+//! tagged; a plain packet socket would hand them over untagged.
+//!
+//! The reading capture takes only frames coming in (`PCAP_D_IN`). Frames going out on the
+//! interface, which are the frames IOL transmits through the other capture and those of the
+//! container's own network stack, are never read, so nothing IOL sends comes back to it.
 
+use std::fs;
 use std::io;
-use std::ops::Range;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use pnet_datalink::{
-    Channel, Config, DataLinkReceiver, DataLinkSender, MacAddr, NetworkInterface, channel,
-    interfaces,
-};
+use pcap::{Active, Capture, Direction, Error};
 
-use crate::port::{Wire, is_timeout};
+use crate::port::Wire;
 
-/// Larger than any frame: the container's veths can be 9600 bytes.
-const READ_BUFFER: usize = 65_536;
-/// Where an Ethernet frame's source address is.
-const SOURCE_MAC: Range<usize> = 6..12;
+/// Where the kernel describes the container's interfaces.
+const SYS_CLASS_NET: &str = "/sys/class/net";
+/// `IFF_UP`, the interface flag set when the interface is up.
+const IFF_UP: u32 = 0x1;
+/// The largest MTU Sherpa gives a link.
+const MAX_MTU: i32 = 9600;
+/// An Ethernet header, and the 802.1Q tag libpcap puts back.
+const ETHERNET_HEADER: i32 = 14;
+const VLAN_TAG: i32 = 4;
+/// The longest frame read: the largest MTU, its Ethernet header and a VLAN tag.
+pub const SNAPLEN: i32 = MAX_MTU + ETHERNET_HEADER + VLAN_TAG;
+/// A filter no frame matches, for the capture that only transmits: the kernel then queues it
+/// nothing.
+const MATCH_NOTHING: &str = "less 1";
 
-/// Interface `name` when it exists and is up. A packet socket bound to an interface that is down
-/// reports an error on every read, so a port waits for the interface to come up, and a port whose
-/// interface goes down detaches.
-pub fn find_interface(name: &str) -> Option<NetworkInterface> {
-    interfaces()
-        .into_iter()
-        .find(|interface| interface.name == name && interface.is_up())
+/// The index of interface `name` when it exists and is up. A capture on an interface that is
+/// down fails, so a port waits for the interface to come up, and a port whose interface goes
+/// down detaches. The index tells an interface made again under the same name from the old one.
+pub fn find_interface(name: &str) -> Option<u32> {
+    let dir = Path::new(SYS_CLASS_NET).join(name);
+    let flags = parse_flags(&fs::read_to_string(dir.join("flags")).ok()?)?;
+    if flags & IFF_UP == 0 {
+        return None;
+    }
+    fs::read_to_string(dir.join("ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
-/// Whether `frame` was sent by the interface whose address is `mac`, which must not go back.
-pub fn is_sent_by(frame: &[u8], mac: MacAddr) -> bool {
-    frame.get(SOURCE_MAC) == Some(mac.octets().as_slice())
+/// Interface flags as `/sys/class/net/<name>/flags` gives them, in hex: `0x1003`.
+fn parse_flags(text: &str) -> Option<u32> {
+    let hex = text.trim().strip_prefix("0x")?;
+    u32::from_str_radix(hex, 16).ok()
 }
 
-/// A packet channel on one interface.
+/// A libpcap error as an I/O error.
+fn to_io(error: Error) -> io::Error {
+    io::Error::other(error)
+}
+
+/// Whether a frame of `len` bytes was read whole, `captured` bytes of it. A cut frame is not
+/// worth relaying.
+fn is_whole(captured: u32, len: u32) -> bool {
+    captured >= len
+}
+
+/// The two captures on one interface.
 pub struct PacketSocket {
     name: String,
     ifindex: u32,
-    mac: Option<MacAddr>,
-    sender: Mutex<Box<dyn DataLinkSender>>,
-    receiver: Mutex<Box<dyn DataLinkReceiver>>,
+    reader: Mutex<Capture<Active>>,
+    writer: Mutex<Capture<Active>>,
 }
 
 impl PacketSocket {
-    /// Open a packet channel on `interface`. Reads time out after `timeout`, so the reader can
-    /// notice that the interface went away.
-    pub fn open(interface: &NetworkInterface, timeout: Duration) -> io::Result<Self> {
-        let config = Config {
-            read_buffer_size: READ_BUFFER,
-            read_timeout: Some(timeout),
-            promiscuous: true,
-            ..Config::default()
-        };
-        let Channel::Ethernet(sender, receiver) = channel(interface, config)? else {
-            return Err(io::Error::other("not an Ethernet channel"));
-        };
+    /// Open the captures on interface `name`, whose index is `ifindex`. Reads time out after
+    /// `timeout`, so the reader can notice that the interface went away.
+    pub fn open(name: &str, ifindex: u32, timeout: Duration) -> io::Result<Self> {
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let reader = Capture::from_device(name)
+            .and_then(|capture| {
+                capture
+                    .promisc(true)
+                    .snaplen(SNAPLEN)
+                    .immediate_mode(true)
+                    .timeout(timeout_ms)
+                    .open()
+            })
+            .map_err(to_io)?;
+        reader.direction(Direction::In).map_err(to_io)?;
+        let mut writer = Capture::from_device(name)
+            .and_then(|capture| capture.snaplen(SNAPLEN).open())
+            .map_err(to_io)?;
+        writer.filter(MATCH_NOTHING, true).map_err(to_io)?;
         Ok(Self {
-            name: interface.name.clone(),
-            ifindex: interface.index,
-            mac: interface.mac,
-            sender: Mutex::new(sender),
-            receiver: Mutex::new(receiver),
+            name: name.to_owned(),
+            ifindex,
+            reader: Mutex::new(reader),
+            writer: Mutex::new(writer),
         })
     }
 }
 
 impl Wire for PacketSocket {
     fn recv(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        let Ok(mut receiver) = self.receiver.lock() else {
-            return Err(io::Error::other("packet receiver lock poisoned"));
+        let Ok(mut reader) = self.reader.lock() else {
+            return Err(io::Error::other("packet reader lock poisoned"));
         };
-        let frame = match receiver.next() {
-            Ok(frame) => frame,
-            Err(error) if is_timeout(&error) => return Ok(None),
-            Err(error) => return Err(error),
+        let packet = match reader.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::TimeoutExpired) => return Ok(None),
+            Err(error) => return Err(to_io(error)),
         };
-        if self.mac.is_some_and(|mac| is_sent_by(frame, mac)) {
+        if !is_whole(packet.header.caplen, packet.header.len) {
+            eprintln!(
+                "iol-bridge: {}: dropped a {}-byte frame longer than {SNAPLEN} bytes",
+                self.name, packet.header.len
+            );
             return Ok(None);
         }
-        let len = frame.len().min(buf.len());
-        buf[..len].copy_from_slice(&frame[..len]);
+        let len = packet.data.len().min(buf.len());
+        buf[..len].copy_from_slice(&packet.data[..len]);
         Ok(Some(len))
     }
 
     fn send(&self, frame: &[u8]) -> io::Result<()> {
-        let Ok(mut sender) = self.sender.lock() else {
-            return Err(io::Error::other("packet sender lock poisoned"));
+        let Ok(mut writer) = self.writer.lock() else {
+            return Err(io::Error::other("packet writer lock poisoned"));
         };
-        sender
-            .send_to(frame, None)
-            .unwrap_or_else(|| Err(io::Error::other("packet channel cannot send")))
+        writer.sendpacket(frame).map_err(to_io)
     }
 
     fn is_attached(&self) -> bool {
-        find_interface(&self.name).is_some_and(|interface| interface.index == self.ifindex)
+        find_interface(&self.name) == Some(self.ifindex)
     }
 }
 
@@ -105,42 +142,34 @@ impl Wire for PacketSocket {
 mod tests {
     use super::*;
 
-    const OWN: MacAddr = MacAddr(0x02, 0x42, 0xac, 0x11, 0x00, 0x02);
-
-    /// An Ethernet frame from `source` to the broadcast address.
-    fn frame_from(source: MacAddr) -> Vec<u8> {
-        let mut frame = vec![0xff; 6];
-        frame.extend_from_slice(&source.octets());
-        frame.extend_from_slice(&[0x08, 0x06, 0, 1]);
-        frame
+    #[test]
+    fn interface_flags_are_read_as_hex() {
+        assert_eq!(parse_flags("0x1003\n"), Some(0x1003));
+        assert_eq!(parse_flags("0x1002"), Some(0x1002));
     }
 
     #[test]
-    fn a_frame_from_the_interfaces_own_address_is_sent_by_it() {
-        assert!(is_sent_by(&frame_from(OWN), OWN));
+    fn interface_flags_not_in_hex_are_refused() {
+        for bad in ["", "1003", "0x", "0xzz"] {
+            assert_eq!(parse_flags(bad), None, "{bad}");
+        }
     }
 
     #[test]
-    fn a_frame_from_iol_or_the_peer_is_not_sent_by_the_interface() {
-        let iol = MacAddr(0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x00);
-        assert!(!is_sent_by(&frame_from(iol), OWN));
+    fn the_snaplen_holds_a_jumbo_frame_with_its_vlan_tag() {
+        // 9600-byte payload, destination and source MACs, the 802.1Q tag and the EtherType.
+        assert_eq!(SNAPLEN, 9600 + 6 + 6 + 4 + 2);
     }
 
     #[test]
-    fn a_frame_to_the_interfaces_address_is_not_sent_by_it() {
-        let mut frame = OWN.octets().to_vec();
-        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x00, 0x08, 0x00]);
-        assert!(!is_sent_by(&frame, OWN));
-    }
-
-    #[test]
-    fn a_runt_frame_is_not_sent_by_the_interface() {
-        assert!(!is_sent_by(&frame_from(OWN)[..10], OWN));
+    fn a_frame_read_whole_is_relayed_and_a_cut_one_is_not() {
+        assert!(is_whole(1518, 1518));
+        assert!(!is_whole(9618, 9622));
     }
 
     #[test]
     fn the_loopback_interface_is_up_and_found() {
-        assert!(find_interface("lo").is_some());
+        assert_eq!(find_interface("lo"), Some(1));
     }
 
     #[test]

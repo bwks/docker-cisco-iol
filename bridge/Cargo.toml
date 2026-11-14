@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [dependencies]
-pnet_datalink = "0.35"
+pcap = "2.5"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
