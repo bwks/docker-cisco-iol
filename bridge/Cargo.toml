@@ -1,0 +1,20 @@
+[package]
+name = "iol-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Relays Ethernet frames between container interfaces and Cisco's IOL launcher sockets"
+license = "MIT"
+publish = false
+
+[dependencies]
+pnet_datalink = "0.35"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

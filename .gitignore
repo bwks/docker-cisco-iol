@@ -1,6 +1,12 @@
-# IOL binary images
+# Cisco images and anything taken from them never go in this repository.
+*.tar
+*.tar.gz
+*.tgz
 *.iol
 *.bin
-
-# IOURC license files
 iourc
+.iourc
+*.yaml
+
+# Bridge build output
+bridge/target/
