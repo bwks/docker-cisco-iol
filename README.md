@@ -66,10 +66,13 @@ The image is the CML image with three additions. Nothing of Cisco's is changed o
   frames arriving on `ethN`, so the frames IOL sends never come back to it. It attaches when `ethN` exists and is up, and re-attaches when it is
   made again, without restarting IOL, so interfaces can be added after IOL has started. While
   a port has no interface, the bridge drops what IOL sends on it, as an unplugged cable would.
+  A second part of the bridge, the link monitor, makes IOL follow link state; see
+  [Link state](#link-state).
 - A static busybox, for the entrypoint's shell and `ip`.
 - The entrypoint (`image/entrypoint.sh`). It writes the launcher's configuration from the
   environment, removes the addresses Docker gave `eth0` (IOL owns the management address on
-  `Ethernet0/0`), starts the bridge and runs the launcher with the console on stdio.
+  `Ethernet0/0`), starts the bridge and runs the launcher with the console on stdio and with
+  `-keep`, when the launcher has it.
 
 | Environment | Default | Meaning |
 |---|---|---|
@@ -89,6 +92,29 @@ The container does not need to be privileged: Docker's default capabilities plus
 are enough. The console is on the container's stdio, so `docker attach` reaches it; it needs a
 TTY (`docker run -it`).
 
+### Link state
+
+IOL learns of a link going down through layer 1 keepalives, not from the container interface.
+Run with `-keep`, Cisco's launcher answers the keepalives IOL sends on each port once a second,
+and listens on `/tmp/control.sock` for `up <N>` and `down <N>`, where `N` is the port and
+`ethN` its interface. After `down N` the launcher stops answering port N; IOL declares the
+interface down after 10 unanswered keepalives, plus IOS's 2 second carrier delay. After `up N`
+the launcher wakes the port and IOL brings it back.
+
+The bridge's link monitor reads the carrier of every `ethN` from
+`/sys/class/net/ethN/carrier` every 500 ms, `eth0` included, and sends the launcher `down N` or
+`up N` whenever a port's carrier differs from what the launcher last accepted. An interface
+that is missing or admin-down counts as having no carrier. The launcher's ports start enabled,
+so at start the monitor sends `down` only for the ports without carrier: ports with a link
+never flap at boot. A command that fails, because the launcher is not listening yet or refuses
+it, is sent again on the next poll. The monitor and the relays do not share state: a relay
+keeps running through a carrier loss, and attaches again to an interface made again, as before.
+
+The entrypoint looks for `-keep` in `/iol-runner -h`. A launcher without it runs as before,
+with a warning on the console that link state is not followed; the link monitor then finds no
+control socket, logs it once and stops. The bridge logs to `/tmp/iol-bridge.log` in the
+container.
+
 Sherpa sets all of this up itself. To run an image by hand:
 
     docker run -dit --cap-add NET_ADMIN \
@@ -102,7 +128,13 @@ Sherpa sets all of this up itself. To run an image by hand:
 - A host transmitting to IOL through a veth with transmit checksum offload hands IOL TCP
   packets without a checksum. Sherpa turns the offload off on the host side of IOL's veths;
   by hand, `ethtool -K <host veth> tx off`.
-- IOL does not see link state: its interface stays up when the container interface goes.
+- IOL follows link state through keepalives, not at once. Measured on the 17.18.02 images, an
+  interface goes down about 12 seconds after its container interface loses carrier
+  (`%LINK-3-UPDOWN`, then `%LINEPROTO-5-UPDOWN` a second later), and comes back about
+  2 seconds after carrier returns. Use BFD where faster detection matters.
+- Interfaces with no link show down, `notconnect` on the L2 image, rather than up.
+- A carrier loss the monitor sees, however short, still takes the IOL interface down and up,
+  about 11 to 14 seconds later: the launcher does not cancel a `down` with an `up`.
 
 ## The bridge
 

@@ -3,10 +3,12 @@
 //!
 //! Usage: `iol-bridge <ports>`. Port 0 is `eth0`, IOL's `Ethernet0/0`; port `N` is `eth<N>`,
 //! `Ethernet<N / 4>/<N % 4>`. Interfaces can be added after IOL starts and made again while it
-//! runs.
+//! runs. A link monitor makes IOL follow each interface's carrier through the launcher's
+//! control socket.
 
 #![forbid(unsafe_code)]
 
+mod link;
 mod packet;
 mod port;
 
@@ -15,6 +17,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
 
+use crate::link::{CONTROL_SOCKET, Monitor, SYSFS_NET};
 use crate::port::{Port, SOCKET_DIR, parse_port_count, run};
 
 fn main() -> ExitCode {
@@ -27,9 +30,23 @@ fn main() -> ExitCode {
         }
     };
 
+    let ports: Vec<Port> = (0..ports)
+        .map(|index| Port::new(index, Path::new(SOCKET_DIR)))
+        .collect();
+
+    // The monitor ends on its own when the launcher has no control socket; the relays do not
+    // depend on it.
+    let mut monitor = Monitor::new(&ports, Path::new(SYSFS_NET), Path::new(CONTROL_SOCKET));
+    if let Err(error) = thread::Builder::new()
+        .name("link".to_owned())
+        .spawn(move || monitor.run())
+    {
+        eprintln!("iol-bridge: cannot start the link monitor: {error}");
+    }
+
     let mut workers = Vec::new();
-    for index in 0..ports {
-        let port = Port::new(index, Path::new(SOCKET_DIR));
+    for port in ports {
+        let index = port.index;
         let spawned = thread::Builder::new()
             .name(port.interface.clone())
             .spawn(move || run(&port).map_err(|error| (port.interface, error)));

@@ -231,6 +231,17 @@ mod tests {
         }
     }
 
+    /// Takes the wire's interface away when dropped, so the relay stops on every way out of a
+    /// test, a failed assertion included. Without it a panic in `thread::scope` waits forever
+    /// to join a relay that is still attached.
+    struct Unplug<'a>(&'a PairWire);
+
+    impl Drop for Unplug<'_> {
+        fn drop(&mut self) {
+            self.0.attached.store(false, Ordering::Relaxed);
+        }
+    }
+
     fn pair_wire() -> (PairWire, UnixDatagram) {
         let (wire, peer) = UnixDatagram::pair().unwrap();
         wire.set_read_timeout(Some(Duration::from_millis(50)))
@@ -295,6 +306,7 @@ mod tests {
         let (wire, peer) = pair_wire();
 
         thread::scope(|scope| {
+            let unplug = Unplug(&wire);
             let relay_thread = scope.spawn(|| relay(&socket, &port.launcher, &wire));
 
             peer.send(b"from the wire").unwrap();
@@ -306,7 +318,7 @@ mod tests {
             let len = peer.recv(&mut buf).unwrap();
             assert_eq!(&buf[..len], b"from IOL");
 
-            wire.attached.store(false, Ordering::Relaxed);
+            drop(unplug);
             let started = Instant::now();
             while !relay_thread.is_finished() {
                 assert!(
@@ -324,6 +336,9 @@ mod tests {
         let dir = test_dir();
         let port = Port::new(5, &dir);
         let launcher = UnixDatagram::bind(&port.launcher).unwrap();
+        // The relay stops reading once it detaches, so the frames sent after that stay queued.
+        // A blocking send would wait for room that never comes.
+        launcher.set_nonblocking(true).unwrap();
         let socket = UnixDatagram::bind(&port.listen).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -335,7 +350,8 @@ mod tests {
 
         thread::scope(|scope| {
             let relay_thread = scope.spawn(|| relay(&socket, &port.launcher, &wire));
-            // No pause between frames, so the relay never reads a timeout.
+            // No pause between frames, so the relay never reads a timeout. The wire is detached
+            // already, so if an assertion fails and the frames stop, the relay stops too.
             let started = Instant::now();
             while !relay_thread.is_finished() {
                 assert!(
@@ -359,6 +375,7 @@ mod tests {
         let (wire, peer) = pair_wire();
 
         thread::scope(|scope| {
+            let _unplug = Unplug(&wire);
             scope.spawn(|| relay(&socket, &port.launcher, &wire));
             peer.send(b"lost").unwrap();
             thread::sleep(Duration::from_millis(100));
@@ -371,8 +388,6 @@ mod tests {
             let mut buf = [0; 64];
             let len = launcher.recv(&mut buf).unwrap();
             assert_eq!(&buf[..len], b"kept");
-
-            wire.attached.store(false, Ordering::Relaxed);
         });
         let _ = fs::remove_dir_all(&dir);
     }
