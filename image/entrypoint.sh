@@ -44,7 +44,7 @@ RUN_UID="$(stat -c %u /tmp/run)"
 RUN_GID="$(stat -c %g /tmp/run)"
 chmod 1777 /tmp
 rm -rf /tmp/s[0-9][0-9].sock /tmp/c[0-9][0-9].sock /tmp/console.sock /tmp/control.sock \
-    /tmp/netio[0-9]*
+    /tmp/netio[0-9]* /tmp/netl1[0-9]*
 
 printf '{"binary":"/binary.iol","memory":%s,"num-eth":%s,"num-serial":0,"local-app":%s,"remote-app":%s,"user-id":%s,"group-id":%s}\n' \
     "$IOL_MEMORY_MB" "$IOL_ETH_PORTS" "$IOL_ID" "$REMOTE_APP_ID" "$RUN_UID" "$RUN_GID" >"$LAUNCHER_CONFIG"
@@ -54,6 +54,19 @@ if [ -e /sys/class/net/eth0 ]; then
     ip addr flush dev eth0
 fi
 
+# With -keep the launcher answers IOL's layer 1 keepalives and takes `up N` / `down N` on
+# /tmp/control.sock, which the bridge uses to make IOL follow each interface's carrier.
+# Launchers without -keep run as before, and IOL's interfaces stay up whatever the link.
+# The launcher prints its flags to stderr.
+set -- -config "$LAUNCHER_CONFIG" -stdio
+if /iol-runner -h 2>&1 | grep -qE '^[[:space:]]*-keep([[:space:]]|$)'; then
+    set -- "$@" -keep
+else
+    echo "sherpa-iol-entrypoint: warning: this launcher has no -keep, so IOL does not follow link state; its interfaces stay up when a link goes down" >&2
+fi
+
 /usr/local/bin/iol-bridge "$IOL_ETH_PORTS" 2>>/tmp/iol-bridge.log &
 
-exec /iol-runner -config "$LAUNCHER_CONFIG" -stdio
+# The launcher replaces this shell, so nothing runs after it exits. The sockets it leaves in
+# the container's /tmp are removed above when the container starts again.
+exec /iol-runner "$@"
