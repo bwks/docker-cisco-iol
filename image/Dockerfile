@@ -7,10 +7,12 @@
 ARG CML_IMAGE
 
 FROM rust:1-alpine AS bridge
+# libpcap-dev has the static libpcap.a the bridge links.
+RUN apk add --no-cache libpcap-dev
 WORKDIR /src
 COPY bridge/Cargo.toml bridge/Cargo.lock ./
 COPY bridge/src ./src
-# Rust links musl statically on Alpine: the binary needs nothing from the CML image.
+# Rust links musl and libpcap statically on Alpine: the binary needs nothing from the CML image.
 RUN cargo build --release --locked
 
 FROM busybox:1.37-musl AS busybox
