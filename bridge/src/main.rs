@@ -5,6 +5,8 @@
 //! `Ethernet<N / 4>/<N % 4>`. Interfaces can be added after IOL starts and made again while it
 //! runs.
 
+#![forbid(unsafe_code)]
+
 mod packet;
 mod port;
 

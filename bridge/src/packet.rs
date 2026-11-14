@@ -1,219 +1,103 @@
-//! A raw `AF_PACKET` socket on one interface, through the few C library calls the standard
-//! library does not wrap. The bridge has no dependencies, so the declarations are here.
+//! A raw `AF_PACKET` channel on one interface, through `pnet_datalink`: bound to the interface,
+//! promiscuous, reading every protocol.
+//!
+//! The kernel never reads a frame back to the socket that sent it, so the frames IOL transmits
+//! do not come back. Other frames sent on the interface come from the container's own network
+//! stack, with the interface's MAC address as their source; they are skipped by that address,
+//! as `pnet_datalink` does not report a frame's packet type.
 
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::io;
-use std::mem::size_of;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::ops::Range;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::port::Wire;
+use pnet_datalink::{
+    Channel, Config, DataLinkReceiver, DataLinkSender, MacAddr, NetworkInterface, channel,
+    interfaces,
+};
 
-const AF_PACKET: c_int = 17;
-const SOCK_RAW: c_int = 3;
-const SOCK_CLOEXEC: c_int = 0o2_000_000;
-/// `ETH_P_ALL`: every protocol.
-const ETH_P_ALL: u16 = 0x0003;
-const SOL_SOCKET: c_int = 1;
-const SO_RCVTIMEO: c_int = 20;
-const SOL_PACKET: c_int = 263;
-const PACKET_ADD_MEMBERSHIP: c_int = 1;
-const PACKET_MR_PROMISC: u16 = 1;
-const PACKET_IGNORE_OUTGOING: c_int = 23;
-/// `pkttype` of a frame this host sent.
-const PACKET_OUTGOING: u8 = 4;
+use crate::port::{Wire, is_timeout};
 
-/// `struct sockaddr_ll`.
-#[repr(C)]
-#[derive(Default)]
-struct SockaddrLl {
-    family: u16,
-    protocol: u16,
-    ifindex: c_int,
-    hatype: u16,
-    pkttype: u8,
-    halen: u8,
-    addr: [u8; 8],
+/// Larger than any frame: the container's veths can be 9600 bytes.
+const READ_BUFFER: usize = 65_536;
+/// Where an Ethernet frame's source address is.
+const SOURCE_MAC: Range<usize> = 6..12;
+
+/// Interface `name` when it exists and is up. A packet socket bound to an interface that is down
+/// reports an error on every read, so a port waits for the interface to come up, and a port whose
+/// interface goes down detaches.
+pub fn find_interface(name: &str) -> Option<NetworkInterface> {
+    interfaces()
+        .into_iter()
+        .find(|interface| interface.name == name && interface.is_up())
 }
 
-/// `struct packet_mreq`.
-#[repr(C)]
-struct PacketMreq {
-    ifindex: c_int,
-    kind: u16,
-    alen: u16,
-    address: [u8; 8],
+/// Whether `frame` was sent by the interface whose address is `mac`, which must not go back.
+pub fn is_sent_by(frame: &[u8], mac: MacAddr) -> bool {
+    frame.get(SOURCE_MAC) == Some(mac.octets().as_slice())
 }
 
-/// `struct timeval` on 64-bit Linux.
-#[repr(C)]
-struct Timeval {
-    tv_sec: i64,
-    tv_usec: i64,
-}
-
-unsafe extern "C" {
-    fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
-    fn bind(fd: c_int, addr: *const c_void, len: c_uint) -> c_int;
-    fn setsockopt(fd: c_int, level: c_int, name: c_int, value: *const c_void, len: c_uint)
-    -> c_int;
-    fn recvfrom(
-        fd: c_int,
-        buf: *mut c_void,
-        len: usize,
-        flags: c_int,
-        addr: *mut c_void,
-        addr_len: *mut c_uint,
-    ) -> isize;
-    fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
-    fn if_nametoindex(name: *const c_char) -> c_uint;
-}
-
-/// The index of interface `name`, or `None` when it does not exist.
-pub fn interface_index(name: &str) -> Option<u32> {
-    let name = CString::new(name).ok()?;
-    // SAFETY: `name` is a valid NUL-terminated string that outlives the call.
-    let index = unsafe { if_nametoindex(name.as_ptr()) };
-    (index != 0).then_some(index)
-}
-
-/// Whether a frame the packet socket read is one this host sent, which must not go back.
-pub fn is_outgoing(pkttype: u8) -> bool {
-    pkttype == PACKET_OUTGOING
-}
-
-/// The size of `T` as a socket length.
-fn socklen<T>() -> c_uint {
-    c_uint::try_from(size_of::<T>()).unwrap_or(c_uint::MAX)
-}
-
-/// A packet socket bound to interface `name`, promiscuous, reading every protocol.
+/// A packet channel on one interface.
 pub struct PacketSocket {
-    fd: OwnedFd,
     name: String,
     ifindex: u32,
+    mac: Option<MacAddr>,
+    sender: Mutex<Box<dyn DataLinkSender>>,
+    receiver: Mutex<Box<dyn DataLinkReceiver>>,
 }
 
 impl PacketSocket {
-    /// Open a packet socket on interface `name`, whose index is `ifindex`. Reads time out after
-    /// `timeout`, so the reader can notice that the interface went away.
-    pub fn open(name: &str, ifindex: u32, timeout: Duration) -> io::Result<Self> {
-        let protocol = ETH_P_ALL.to_be();
-        // SAFETY: plain system call with constant arguments.
-        let raw = unsafe { socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, c_int::from(protocol)) };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `raw` is a socket this function just opened and nothing else owns.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let ifindex_c =
-            c_int::try_from(ifindex).map_err(|error| io::Error::other(error.to_string()))?;
-
-        let address = SockaddrLl {
-            family: u16::try_from(AF_PACKET).unwrap_or_default(),
-            protocol,
-            ifindex: ifindex_c,
-            ..SockaddrLl::default()
+    /// Open a packet channel on `interface`. Reads time out after `timeout`, so the reader can
+    /// notice that the interface went away.
+    pub fn open(interface: &NetworkInterface, timeout: Duration) -> io::Result<Self> {
+        let config = Config {
+            read_buffer_size: READ_BUFFER,
+            read_timeout: Some(timeout),
+            promiscuous: true,
+            ..Config::default()
         };
-        // SAFETY: `address` is a valid `sockaddr_ll` and the length is its size.
-        let bound = unsafe {
-            bind(
-                fd.as_raw_fd(),
-                (&raw const address).cast(),
-                socklen::<SockaddrLl>(),
-            )
+        let Channel::Ethernet(sender, receiver) = channel(interface, config)? else {
+            return Err(io::Error::other("not an Ethernet channel"));
         };
-        if bound < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let membership = PacketMreq {
-            ifindex: ifindex_c,
-            kind: PACKET_MR_PROMISC,
-            alen: 0,
-            address: [0; 8],
-        };
-        set_option(&fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &membership)?;
-
-        // Older kernels do not have it; outgoing frames are also skipped by type on read.
-        let ignore: c_int = 1;
-        let _ = set_option(&fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore);
-
-        let timeval = Timeval {
-            tv_sec: i64::try_from(timeout.as_secs()).unwrap_or(i64::MAX),
-            tv_usec: i64::from(timeout.subsec_micros()),
-        };
-        set_option(&fd, SOL_SOCKET, SO_RCVTIMEO, &timeval)?;
-
         Ok(Self {
-            fd,
-            name: name.to_owned(),
-            ifindex,
+            name: interface.name.clone(),
+            ifindex: interface.index,
+            mac: interface.mac,
+            sender: Mutex::new(sender),
+            receiver: Mutex::new(receiver),
         })
-    }
-}
-
-/// Set socket option `name` at `level` to `value`.
-fn set_option<T>(fd: &OwnedFd, level: c_int, name: c_int, value: &T) -> io::Result<()> {
-    // SAFETY: `value` points to a live `T` and the length is its size.
-    let result = unsafe {
-        setsockopt(
-            fd.as_raw_fd(),
-            level,
-            name,
-            (&raw const *value).cast(),
-            socklen::<T>(),
-        )
-    };
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 
 impl Wire for PacketSocket {
     fn recv(&self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        let mut address = SockaddrLl::default();
-        let mut address_len = socklen::<SockaddrLl>();
-        // SAFETY: `buf` and `address` are valid for writes of the lengths given.
-        let read = unsafe {
-            recvfrom(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                0,
-                (&raw mut address).cast(),
-                &raw mut address_len,
-            )
+        let Ok(mut receiver) = self.receiver.lock() else {
+            return Err(io::Error::other("packet receiver lock poisoned"));
         };
-        if read < 0 {
-            let error = io::Error::last_os_error();
-            return match error.kind() {
-                io::ErrorKind::WouldBlock
-                | io::ErrorKind::TimedOut
-                | io::ErrorKind::Interrupted => Ok(None),
-                _ => Err(error),
-            };
-        }
-        if is_outgoing(address.pkttype) {
+        let frame = match receiver.next() {
+            Ok(frame) => frame,
+            Err(error) if is_timeout(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if self.mac.is_some_and(|mac| is_sent_by(frame, mac)) {
             return Ok(None);
         }
-        Ok(Some(usize::try_from(read).unwrap_or_default()))
+        let len = frame.len().min(buf.len());
+        buf[..len].copy_from_slice(&frame[..len]);
+        Ok(Some(len))
     }
 
     fn send(&self, frame: &[u8]) -> io::Result<()> {
-        // SAFETY: `frame` is valid for reads of its length.
-        let sent = unsafe { send(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) };
-        if sent < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
+        let Ok(mut sender) = self.sender.lock() else {
+            return Err(io::Error::other("packet sender lock poisoned"));
+        };
+        sender
+            .send_to(frame, None)
+            .unwrap_or_else(|| Err(io::Error::other("packet channel cannot send")))
     }
 
     fn is_attached(&self) -> bool {
-        interface_index(&self.name) == Some(self.ifindex)
+        find_interface(&self.name).is_some_and(|interface| interface.index == self.ifindex)
     }
 }
 
@@ -221,38 +105,46 @@ impl Wire for PacketSocket {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_frame_this_host_sent_is_outgoing() {
-        assert!(is_outgoing(4));
+    const OWN: MacAddr = MacAddr(0x02, 0x42, 0xac, 0x11, 0x00, 0x02);
+
+    /// An Ethernet frame from `source` to the broadcast address.
+    fn frame_from(source: MacAddr) -> Vec<u8> {
+        let mut frame = vec![0xff; 6];
+        frame.extend_from_slice(&source.octets());
+        frame.extend_from_slice(&[0x08, 0x06, 0, 1]);
+        frame
     }
 
     #[test]
-    fn frames_for_this_host_and_others_are_not_outgoing() {
-        // PACKET_HOST, PACKET_BROADCAST, PACKET_MULTICAST, PACKET_OTHERHOST
-        for pkttype in [0, 1, 2, 3] {
-            assert!(!is_outgoing(pkttype));
-        }
+    fn a_frame_from_the_interfaces_own_address_is_sent_by_it() {
+        assert!(is_sent_by(&frame_from(OWN), OWN));
     }
 
     #[test]
-    fn the_loopback_interface_has_an_index() {
-        assert!(interface_index("lo").is_some());
+    fn a_frame_from_iol_or_the_peer_is_not_sent_by_the_interface() {
+        let iol = MacAddr(0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x00);
+        assert!(!is_sent_by(&frame_from(iol), OWN));
     }
 
     #[test]
-    fn a_missing_interface_has_no_index() {
-        assert_eq!(interface_index("no-such-if0"), None);
+    fn a_frame_to_the_interfaces_address_is_not_sent_by_it() {
+        let mut frame = OWN.octets().to_vec();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0x00, 0x01, 0x00, 0x08, 0x00]);
+        assert!(!is_sent_by(&frame, OWN));
     }
 
     #[test]
-    fn a_name_with_a_nul_has_no_index() {
-        assert_eq!(interface_index("eth\0"), None);
+    fn a_runt_frame_is_not_sent_by_the_interface() {
+        assert!(!is_sent_by(&frame_from(OWN)[..10], OWN));
     }
 
     #[test]
-    fn the_c_structs_have_the_kernel_sizes() {
-        assert_eq!(size_of::<SockaddrLl>(), 20);
-        assert_eq!(size_of::<PacketMreq>(), 16);
-        assert_eq!(size_of::<Timeval>(), 16);
+    fn the_loopback_interface_is_up_and_found() {
+        assert!(find_interface("lo").is_some());
+    }
+
+    #[test]
+    fn a_missing_interface_is_not_found() {
+        assert!(find_interface("no-such-if0").is_none());
     }
 }

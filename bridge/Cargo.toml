@@ -7,12 +7,12 @@ license = "MIT"
 publish = false
 
 [dependencies]
+pnet_datalink = "0.35"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
-undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 lto = true

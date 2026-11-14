@@ -60,9 +60,10 @@ The image is the CML image with three additions. Nothing of Cisco's is changed o
   launcher, `/iol-runner`, exposes each IOL port as a pair of Unix datagram sockets carrying
   Ethernet frames: it binds `/tmp/sNN.sock` and sends to `/tmp/cNN.sock`, where `NN` is
   `slot * 4 + port`. The bridge binds `cNN.sock` and relays its frames to and from the
-  container interface `ethN` through a packet socket. It attaches when `ethN` appears and
-  re-attaches when it is made again, without restarting IOL, so interfaces can be added after
-  IOL has started.
+  container interface `ethN` through a packet socket, opened with `pnet_datalink`; the bridge
+  has no `unsafe` code. It attaches when `ethN` exists and is up, and re-attaches when it is
+  made again, without restarting IOL, so interfaces can be added after IOL has started. While
+  a port has no interface, the bridge drops what IOL sends on it, as an unplugged cable would.
 - A static busybox, for the entrypoint's shell and `ip`.
 - The entrypoint (`image/entrypoint.sh`). It writes the launcher's configuration from the
   environment, removes the addresses Docker gave `eth0` (IOL owns the management address on

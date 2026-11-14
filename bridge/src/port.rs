@@ -12,9 +12,9 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::packet::{PacketSocket, interface_index};
+use crate::packet::{PacketSocket, find_interface};
 
 /// Where the launcher keeps its port sockets.
 pub const SOCKET_DIR: &str = "/tmp";
@@ -75,8 +75,8 @@ pub fn parse_port_count(args: &[String]) -> Result<u16, String> {
     }
 }
 
-/// Run port `port` for good: bind its socket, then attach to its interface whenever it exists.
-/// Returns only when the socket cannot be bound.
+/// Run port `port` for good: bind its socket, then attach to its interface whenever it exists
+/// and is up. Returns only when the socket cannot be bound.
 pub fn run(port: &Port) -> io::Result<()> {
     match fs::remove_file(&port.listen) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
@@ -87,23 +87,37 @@ pub fn run(port: &Port) -> io::Result<()> {
     fs::set_permissions(&port.listen, fs::Permissions::from_mode(SOCKET_MODE))?;
     socket.set_read_timeout(Some(POLL))?;
     loop {
-        let Some(ifindex) = interface_index(&port.interface) else {
-            thread::sleep(POLL);
+        let Some(interface) = find_interface(&port.interface) else {
+            discard(&socket, POLL);
             continue;
         };
-        match PacketSocket::open(&port.interface, ifindex, POLL) {
+        match PacketSocket::open(&interface, POLL) {
             Ok(wire) => {
                 eprintln!(
-                    "iol-bridge: {} attached (ifindex {ifindex})",
-                    port.interface
+                    "iol-bridge: {} attached (ifindex {})",
+                    port.interface, interface.index
                 );
                 relay(&socket, &port.launcher, &wire);
                 eprintln!("iol-bridge: {} detached", port.interface);
             }
             Err(error) => {
                 eprintln!("iol-bridge: cannot open {}: {error}", port.interface);
-                thread::sleep(POLL);
+                discard(&socket, POLL);
             }
+        }
+    }
+}
+
+/// Drop the frames IOL sends on a port with no interface for `period`, as a wire with nothing on
+/// it would. Left unread, they fill the socket and the launcher stalls on every port.
+fn discard(socket: &UnixDatagram, period: Duration) {
+    let deadline = Instant::now() + period;
+    let mut buf = vec![0; FRAME_BUFFER];
+    while Instant::now() < deadline {
+        if let Err(error) = socket.recv(&mut buf)
+            && !is_timeout(&error)
+        {
+            thread::sleep(deadline.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -149,19 +163,12 @@ fn launcher_to_wire(socket: &UnixDatagram, wire: &impl Wire, attached: &AtomicBo
         match socket.recv(&mut buf) {
             Ok(len) => {
                 if let Err(error) = wire.send(&buf[..len])
-                    && is_gone(&error)
+                    && (is_gone(&error) || !wire.is_attached())
                 {
                     attached.store(false, Ordering::Relaxed);
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
+            Err(error) if is_timeout(&error) => {
                 if !wire.is_attached() {
                     attached.store(false, Ordering::Relaxed);
                 }
@@ -174,6 +181,14 @@ fn launcher_to_wire(socket: &UnixDatagram, wire: &impl Wire, attached: &AtomicBo
     }
 }
 
+/// Whether a read ended without a frame because it timed out or was interrupted.
+pub fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 /// Whether a send failed because the interface is gone or down, rather than for the frame.
 fn is_gone(error: &io::Error) -> bool {
     // ENXIO, ENODEV, ENETDOWN
@@ -184,7 +199,6 @@ fn is_gone(error: &io::Error) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
-    use std::time::Instant;
 
     static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -322,6 +336,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_send_on_a_vanished_interface_detaches_while_iol_keeps_sending() {
+        let dir = test_dir();
+        let port = Port::new(5, &dir);
+        let launcher = UnixDatagram::bind(&port.launcher).unwrap();
+        let socket = UnixDatagram::bind(&port.listen).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let (wire, peer) = pair_wire();
+        // The send fails with ECONNREFUSED, which alone does not mean the interface is gone.
+        drop(peer);
+        wire.attached.store(false, Ordering::Relaxed);
+
+        thread::scope(|scope| {
+            let relay_thread = scope.spawn(|| relay(&socket, &port.launcher, &wire));
+            // No pause between frames, so the relay never reads a timeout.
+            let started = Instant::now();
+            while !relay_thread.is_finished() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "relay kept running"
+                );
+                let _ = launcher.send_to(b"from IOL", &port.listen);
+            }
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn frames_from_the_wire_before_the_launcher_listens_are_dropped() {
         let dir = test_dir();
         let port = Port::new(2, &dir);
@@ -397,6 +440,36 @@ mod tests {
                 "socket not bound"
             );
             thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_port_waiting_for_its_interface_drops_what_iol_sends() {
+        let dir = test_dir();
+        let mut port = Port::new(6, &dir);
+        port.interface = "no-such-if6".to_owned();
+        let listen = port.listen.clone();
+        thread::spawn(move || run(&port));
+
+        let launcher = UnixDatagram::unbound().unwrap();
+        let started = Instant::now();
+        while launcher.send_to(b"x", &listen).is_err() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "socket not bound"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Far more than the socket queues: a port that does not read blocks the sender.
+        launcher
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        for frame in 0..5_000 {
+            assert!(
+                launcher.send_to(&[0; 1500], &listen).is_ok(),
+                "frame {frame} not taken"
+            );
         }
         let _ = fs::remove_dir_all(&dir);
     }
